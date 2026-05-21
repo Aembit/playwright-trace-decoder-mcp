@@ -1,4 +1,4 @@
-import { ParsedTrace, TraceAction } from "./types.js";
+import { ParsedTrace, TraceAction, LocatorSourceResult } from "./types.js";
 import { snapshotToAriaYaml } from "./aria-translator.js";
 
 // ---------------------------------------------------------------------------
@@ -487,5 +487,66 @@ export function detectPerformanceAnomalies(
     p50_action_duration_ms: Math.round(p50),
     p95_action_duration_ms: Math.round(p95),
     total_frame_drop_count: totalFrameDropCount,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// map_locator_to_source
+// ---------------------------------------------------------------------------
+
+export function mapLocatorToSource(trace: ParsedTrace, actionIndex?: number): LocatorSourceResult {
+  let action: TraceAction | undefined;
+
+  if (actionIndex !== undefined) {
+    action = trace.actions[actionIndex];
+  } else {
+    action = trace.actions.find((a) => a.error);
+  }
+
+  if (!action) {
+    throw new Error(
+      actionIndex !== undefined
+        ? `Action at index ${actionIndex} not found`
+        : "No failing action found in trace"
+    );
+  }
+
+  const beforeEvent = action.metadata?.before as Record<string, unknown> | undefined;
+  const stepId = beforeEvent?.stepId;
+
+  let stepTitle: string | undefined;
+  let stack: LocatorSourceResult["stack"] = [];
+
+  if (stepId) {
+    const runnerEvent = trace.events.find(
+      (e) =>
+        (e.class === "Test" || e.origin === "testRunner") &&
+        e.type === "before" &&
+        (e.stepId === stepId || e.callId === stepId)
+    );
+
+    if (runnerEvent) {
+      stepTitle = runnerEvent.title ? String(runnerEvent.title) : undefined;
+      if (runnerEvent.stack && Array.isArray(runnerEvent.stack)) {
+        stack = runnerEvent.stack.map((frame: unknown) => {
+          const f = frame as Record<string, unknown>;
+          return {
+            file: String(f.file ?? ""),
+            line: Number(f.line ?? 0),
+            column: Number(f.column ?? 0),
+            function: f.function ? String(f.function) : undefined,
+          };
+        });
+      }
+    }
+  }
+
+  return {
+    action_type: action.type,
+    locator: action.locator,
+    error: action.error,
+    step_title: stepTitle,
+    stack,
+    source_location: stack.length > 0 ? stack[0] : null,
   };
 }

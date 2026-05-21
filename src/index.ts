@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import * as z from "zod/v4";
+import { z } from "zod/v4";
 import {
   parseTraceZip,
   extractScreenshots,
   extractTraceMetadataStrict,
   resolveTracePath,
+  extractCriticalFrames,
+  trimTraceArchive,
 } from "./trace-parser.js";
 import { snapshotToAriaYaml } from "./aria-translator.js";
 import {
@@ -15,12 +17,13 @@ import {
   getDomMutationDelta,
   getCausalChain,
   detectPerformanceAnomalies,
+  mapLocatorToSource,
 } from "./diagnostics.js";
 import { generateErrorSignature, compareTraces } from "./cross-trace.js";
 
 const server = new McpServer({
   name: "playwright-trace-decoder",
-  version: "0.2.3",
+  version: "0.3.0",
 });
 
 const traceInputSchema = z.object({
@@ -628,6 +631,113 @@ server.registerTool(
         slow_action_threshold_ms ?? 500,
         frame_drop_threshold_ms ?? 50
       );
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "map_locator_to_source",
+  {
+    description:
+      "Maps a failing browser interaction (or a specific action index) to its corresponding " +
+      "line of code in the test file using the execution stack from the test runner.",
+    inputSchema: traceInputSchema.extend({
+      action_index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Index of the action (0-based). Defaults to the failing action."),
+    }),
+  },
+  async ({ trace_path, action_index }) => {
+    try {
+      const resolved = await resolveTracePath(trace_path);
+      const trace = await parseTraceZip(resolved);
+      const result = mapLocatorToSource(trace, action_index);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "extract_critical_frames",
+  {
+    description:
+      "Extracts key screencast screenshots (base64 JPEG) from a temporal window around a " +
+      "test failure or the end of the trace, resolved with their associated test step titles.",
+    inputSchema: traceInputSchema.extend({
+      lookback_ms: z
+        .number()
+        .int()
+        .min(0)
+        .default(5000)
+        .optional()
+        .describe("Lookback duration before failure in ms (default 5000)"),
+      lookforward_ms: z
+        .number()
+        .int()
+        .min(0)
+        .default(1000)
+        .optional()
+        .describe("Lookforward duration after failure in ms (default 1000)"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .default(10)
+        .optional()
+        .describe("Maximum number of screenshots to return (default 10)"),
+    }),
+  },
+  async ({ trace_path, lookback_ms, lookforward_ms, limit }) => {
+    try {
+      const resolved = await resolveTracePath(trace_path);
+      const result = await extractCriticalFrames(
+        resolved,
+        lookback_ms ?? 5000,
+        lookforward_ms ?? 1000,
+        limit ?? 10
+      );
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "trim_trace_archive",
+  {
+    description:
+      "Shrinks a Playwright trace zip file by deleting screenshots outside the critical " +
+      "failure window (t_fail - 5s to t_fail + 1s). Returns original vs trimmed size and path to the new archive (.trimmed.zip).",
+    inputSchema: traceInputSchema.extend({
+      divergence_only: z
+        .boolean()
+        .default(true)
+        .optional()
+        .describe(
+          "If true, removes screenshots outside the critical failure window. If false, leaves them intact."
+        ),
+    }),
+  },
+  async ({ trace_path, divergence_only }) => {
+    try {
+      const resolved = await resolveTracePath(trace_path);
+      const result = await trimTraceArchive(resolved, divergence_only ?? true);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };
