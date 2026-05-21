@@ -16,6 +16,8 @@ import {
   TraceEvent,
   FrameSnapshot,
   TraceScreenshot,
+  CriticalFrameResult,
+  TrimTraceResult,
 } from "./types.js";
 
 // If trace_path is a URL, download it to a stable temp path keyed by URL hash.
@@ -235,7 +237,7 @@ function normalizeActionType(before: TraceEvent): string {
   if (before.apiName) return String(before.apiName);
 
   // If apiName is missing, try to use title first (usually has the most descriptive name)
-  const { class: className, method, title } = before as Record<string, any>;
+  const { class: className, method, title } = before as Record<string, unknown>;
 
   if (title) {
     return String(title);
@@ -360,4 +362,190 @@ function extractConsole(events: TraceEvent[]): ConsoleMessage[] {
         time: Number(e.time ?? 0),
       };
     });
+}
+
+export async function extractCriticalFrames(
+  zipPath: string,
+  lookbackMs = 5000,
+  lookforwardMs = 1000,
+  limit = 10
+): Promise<CriticalFrameResult[]> {
+  const trace = await parseTraceZip(zipPath);
+  const screenshots = extractScreenshots(zipPath);
+
+  if (screenshots.length === 0) {
+    return [];
+  }
+
+  // 1. Find t_fail (startTime of failing action)
+  const failedAction = trace.actions.find((a) => a.error);
+  let t_fail = 0;
+
+  if (failedAction) {
+    t_fail = failedAction.startTime;
+  } else {
+    t_fail = screenshots[screenshots.length - 1].timestamp;
+  }
+
+  // 2. Define temporal window
+  const windowStart = t_fail - lookbackMs;
+  const windowEnd = t_fail + lookforwardMs;
+
+  // 3. Filter screenshots by window
+  let candidates = screenshots.filter(
+    (s) => s.timestamp >= windowStart && s.timestamp <= windowEnd
+  );
+
+  if (candidates.length === 0) {
+    const sortedByDiff = [...screenshots].sort(
+      (a, b) => Math.abs(a.timestamp - t_fail) - Math.abs(b.timestamp - t_fail)
+    );
+    candidates = [sortedByDiff[0]];
+  }
+
+  // 4. Sample down to limit, keeping the one closest to t_fail
+  let selected = candidates;
+  if (candidates.length > limit) {
+    let closestIdx = 0;
+    let minDiff = Infinity;
+    candidates.forEach((s, idx) => {
+      const diff = Math.abs(s.timestamp - t_fail);
+      if (diff < minDiff) {
+        minDiff = diff;
+        closestIdx = idx;
+      }
+    });
+
+    if (limit === 1) {
+      selected = [candidates[closestIdx]];
+    } else {
+      const indices = new Set<number>();
+      indices.add(closestIdx);
+      indices.add(0);
+      indices.add(candidates.length - 1);
+
+      const step = (candidates.length - 1) / (limit - 1);
+      for (let i = 1; i < limit - 1; i++) {
+        indices.add(Math.round(i * step));
+      }
+
+      let nextIdx = 0;
+      while (indices.size < limit && nextIdx < candidates.length) {
+        indices.add(nextIdx++);
+      }
+
+      selected = Array.from(indices)
+        .sort((a, b) => a - b)
+        .map((idx) => candidates[idx]);
+    }
+  }
+
+  // 5. Correlate timestamps with test runner steps
+  const results: CriticalFrameResult[] = [];
+  for (const s of selected) {
+    const activeAction = trace.actions.find(
+      (a) => s.timestamp >= a.startTime && s.timestamp <= a.endTime
+    );
+
+    let stepTitle: string | undefined;
+    if (activeAction) {
+      const stepId = (activeAction.metadata?.before as Record<string, unknown> | undefined)?.stepId;
+      if (stepId) {
+        const runnerEvent = trace.events.find(
+          (e) =>
+            (e.class === "Test" || e.origin === "testRunner") &&
+            e.type === "before" &&
+            (e.stepId === stepId || e.callId === stepId)
+        );
+        if (runnerEvent?.title) {
+          stepTitle = String(runnerEvent.title);
+        }
+      }
+      if (!stepTitle) {
+        stepTitle = activeAction.type;
+      }
+    }
+
+    results.push({
+      timestamp: s.timestamp,
+      data: s.data.toString("base64"),
+      mime_type: "image/jpeg",
+      step_title: stepTitle,
+    });
+  }
+
+  return results.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+export async function trimTraceArchive(
+  zipPath: string,
+  divergenceOnly = true
+): Promise<TrimTraceResult> {
+  const originalStats = statSync(zipPath);
+  const originalSize = originalStats.size;
+
+  const trace = await parseTraceZip(zipPath);
+  const zip = new AdmZip(zipPath);
+
+  // 1. Find failing action timestamp
+  const failedAction = trace.actions.find((a) => a.error);
+  let t_fail = 0;
+
+  if (failedAction) {
+    t_fail = failedAction.startTime;
+  } else {
+    const screenshots = extractScreenshots(zipPath);
+    if (screenshots.length > 0) {
+      t_fail = screenshots[screenshots.length - 1].timestamp;
+    } else {
+      const dest = zipPath.replace(/\.zip$/, ".trimmed.zip");
+      zip.writeZip(dest);
+      const newStats = statSync(dest);
+      return {
+        original_size_bytes: originalSize,
+        trimmed_size_bytes: newStats.size,
+        compression_ratio_percent: 0,
+        trimmed_trace_path: dest,
+      };
+    }
+  }
+
+  // Window: t_fail - 5000ms to t_fail + 1000ms
+  const windowStart = t_fail - 5000;
+  const windowEnd = t_fail + 1000;
+
+  if (divergenceOnly) {
+    const entries = zip.getEntries();
+    for (const entry of entries) {
+      const match = SCREENSHOT_RE.exec(entry.entryName);
+      if (!match) continue;
+      const timestamp = Number(match[1]);
+
+      if (timestamp < windowStart || timestamp > windowEnd) {
+        zip.deleteFile(entry.entryName);
+      }
+    }
+  }
+
+  let dest = "";
+  if (zipPath.endsWith(".pwtrace.zip")) {
+    dest = zipPath.replace(/\.pwtrace\.zip$/, ".trimmed.pwtrace.zip");
+  } else {
+    dest = zipPath.replace(/\.zip$/, ".trimmed.zip");
+  }
+
+  zip.writeZip(dest);
+
+  const trimmedStats = statSync(dest);
+  const trimmedSize = trimmedStats.size;
+
+  const ratio =
+    originalSize > 0 ? Math.round(((originalSize - trimmedSize) / originalSize) * 100) : 0;
+
+  return {
+    original_size_bytes: originalSize,
+    trimmed_size_bytes: trimmedSize,
+    compression_ratio_percent: ratio,
+    trimmed_trace_path: dest,
+  };
 }

@@ -77,3 +77,26 @@ export interface ParsedTrace {
   console: ConsoleMessage[];
   snapshots: FrameSnapshot[];
 }
+
+export interface CriticalFrameResult {
+  timestamp: number;
+  data: string; // base64 JPEG
+  mime_type: string;
+  step_title?: string;
+}
+
+export interface LocatorSourceResult {
+  action_type: string;
+  locator?: string;
+  error?: string;
+  step_title?: string;
+  stack: Array<{ file: string; line: number; column: number; function?: string }>;
+  source_location?: { file: string; line: number; column: number; function?: string } | null;
+}
+
+export interface TrimTraceResult {
+  original_size_bytes: number;
+  trimmed_size_bytes: number;
+  compression_ratio_percent: number;
+  trimmed_trace_path: string;
+}

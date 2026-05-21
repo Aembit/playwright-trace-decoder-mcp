@@ -13,6 +13,75 @@ When a Playwright test fails in CI, you get a `trace.zip`. It's a binary blob. L
 
 This MCP server solves that: 16 focused tools that expose exactly the signal an agent needs to diagnose a failure, with pagination and ARIA compression to keep token costs low.
 
+## 🐸 E2E Failure Investigation Example
+
+Here is a quick look at how an AI agent uses the new tools in v0.3.0 to instantly find and inspect a failure:
+
+1. **Locate the exact source code bug** via `map_locator_to_source`:
+
+   ```json
+   // Request arguments
+   { "trace_path": "/path/to/trace.zip" }
+
+   // Response payload
+   {
+     "action_type": "Click locator('#super-toad-not-found')",
+     "locator": "#super-toad-not-found",
+     "error": "TimeoutError: locator.click: Timeout 5000ms exceeded.",
+     "step_title": "Click locator('#super-toad-not-found')",
+     "stack": [
+       {
+         "file": "/Users/albertdev/Projects/ideas/sample-playwright-project/tests/google-pom.spec.ts",
+         "line": 18,
+         "column": 17
+       }
+     ],
+     "source_location": {
+       "file": "/Users/albertdev/Projects/ideas/sample-playwright-project/tests/google-pom.spec.ts",
+       "line": 18,
+       "column": 17
+     }
+   }
+   ```
+
+   _No more guessing! The agent knows exactly which file, line, and column caused the timeout._
+
+2. **Extract critical visual frames** around the failure via `extract_critical_frames`:
+
+   ```json
+   // Request arguments
+   { "trace_path": "/path/to/trace.zip", "limit": 1 }
+
+   // Response payload
+   [
+     {
+       "timestamp": 1779137404287,
+       "mime_type": "image/jpeg",
+       "step_title": "Clicking #super-toad-not-found element",
+       "data": "/9j/4AAQSkZJRgABAQAAAQABAAD/..." // Base64 JPEG
+     }
+   ]
+   ```
+
+   _Allows the agent to visual-verify page state immediately before/after failure without pulling massive image lists._
+
+3. **Trim the trace to save CI storage / transfer costs** via `trim_trace_archive`:
+
+   ```json
+   // Request arguments
+   { "trace_path": "/path/to/trace.zip" }
+
+   // Response payload
+   {
+     "original_size_bytes": 2449682,
+     "trimmed_size_bytes": 511698,
+     "compression_ratio_percent": 79,
+     "trimmed_trace_path": "/path/to/trace.trimmed.zip"
+   }
+   ```
+
+   _Shrinks large traces by deleting screenshots outside the critical failure window. Saved 79% of disk space!_
+
 ## 🛠️ Tools
 
 Tools are grouped by how an agent should sequence them when diagnosing a failure.
@@ -35,13 +104,14 @@ All list-returning tools support `limit` (1–500, default 50) and `offset` pagi
 
 ### DOM / UI analysis
 
-| Tool                          | Arguments                         | What it returns                                                                                                                                                        |
-| ----------------------------- | --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `get_aria_accessibility_tree` | `trace_path`, `action_index?`     | ARIA accessibility tree as compact YAML (~90% fewer tokens than raw HTML). Defaults to the snapshot at the failed action.                                              |
-| `get_dom_mutation_delta`      | `trace_path`, `action_index`      | Set-diff of ARIA lines before vs after a specific action — added/removed elements only, not two full DOM dumps                                                         |
-| `get_screenshot_at_failure`   | `trace_path`, `screenshot_index?` | Base64 JPEG screenshot closest to the moment of failure. Use when ARIA tree is empty (captcha, blank page). `screenshot_index` lets you walk the full visual timeline. |
-| `analyze_race_conditions`     | `trace_path`                      | Network requests that were in-flight when an interaction or assertion fired                                                                                            |
-| `correlate_dom_and_network`   | `trace_path`                      | For each action where a fetch completed and the DOM mutated within ±100ms: triggering URL, response status, body snippet, and exact nodes added/removed                |
+| Tool                          | Arguments                                                 | What it returns                                                                                                                                                        |
+| ----------------------------- | --------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_aria_accessibility_tree` | `trace_path`, `action_index?`                             | ARIA accessibility tree as compact YAML (~90% fewer tokens than raw HTML). Defaults to the snapshot at the failed action.                                              |
+| `get_dom_mutation_delta`      | `trace_path`, `action_index`                              | Set-diff of ARIA lines before vs after a specific action — added/removed elements only, not two full DOM dumps                                                         |
+| `get_screenshot_at_failure`   | `trace_path`, `screenshot_index?`                         | Base64 JPEG screenshot closest to the moment of failure. Use when ARIA tree is empty (captcha, blank page). `screenshot_index` lets you walk the full visual timeline. |
+| `analyze_race_conditions`     | `trace_path`                                              | Network requests that were in-flight when an interaction or assertion fired                                                                                            |
+| `correlate_dom_and_network`   | `trace_path`                                              | For each action where a fetch completed and the DOM mutated within ±100ms: triggering URL, response status, body snippet, and exact nodes added/removed                |
+| `extract_critical_frames`     | `trace_path`, `lookback_ms?`, `lookforward_ms?`, `limit?` | Extracts key screencast screenshots (base64) from a temporal window around failure, resolved with step titles                                                          |
 
 ### Root-cause analysis
 
@@ -50,12 +120,14 @@ All list-returning tools support `limit` (1–500, default 50) and `offset` pagi
 | `get_causal_chain_for_failure` | `trace_path`, `lookback_ms?`               | Chronological chain of preceding actions, network errors, and console errors leading to the failure (default window: 5 s)                          |
 | `generate_error_signature`     | `trace_path`                               | Stable 12-char SHA-1 hash of the normalized error — use to group duplicate failures across parallel CI runs                                        |
 | `compare_traces`               | `passing_trace_path`, `failing_trace_path` | LCS-aligned action sequence between a passing and failing run: structural divergence, timing anomalies (>500 ms), unmatched actions, network delta |
+| `map_locator_to_source`        | `trace_path`, `action_index?`              | Maps a failing browser interaction (or specific action index) to the exact line of test code via runner execution stack                            |
 
 ### Performance analysis
 
 | Tool                           | Arguments                                                             | What it returns                                                                                                                                                                                  |
 | ------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `detect_performance_anomalies` | `trace_path`, `slow_action_threshold_ms?`, `frame_drop_threshold_ms?` | Ranked list of slow actions and frame drops with `suspected_cause` (main thread blocked / network saturation / navigation timeout). Also reports p50/p95 action duration and a memory leak flag. |
+| `trim_trace_archive`           | `trace_path`, `divergence_only?`                                      | Shrinks trace zip by deleting screenshots outside critical failure window (t_fail - 5s to t_fail + 1s). Returns trimmed path & size delta.                                                       |
 
 ## 💬 Suggested agent workflow
 
