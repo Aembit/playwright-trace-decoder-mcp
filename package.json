@@ -26,10 +26,10 @@
       "prettier --write"
     ]
   },
-  "mcpName": "io.github.vola-trebla/playwright-trace-decoder-mcp",
+  "mcpName": "com.aembit/playwright-trace-decoder-mcp",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vola-trebla/playwright-trace-decoder-mcp.git"
+    "url": "https://github.com/Aembit/playwright-trace-decoder-mcp.git"
   },
   "keywords": [
     "playwright",
@@ -47,7 +47,7 @@
     "LICENSE",
     "server.json"
   ],
-  "author": "vola-trebla",
+  "author": "Aembit",
   "license": "MIT",
   "type": "module",
   "dependencies": {

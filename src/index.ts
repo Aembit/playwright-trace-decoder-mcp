@@ -9,6 +9,7 @@ import {
   resolveTracePath,
   extractCriticalFrames,
   trimTraceArchive,
+  getResolvedSnapshotHtml,
 } from "./trace-parser.js";
 import { snapshotToAriaYaml } from "./aria-translator.js";
 import {
@@ -241,30 +242,45 @@ server.registerTool(
         const action = trace.actions[action_index];
         if (action) {
           const callId = (action.metadata as Record<string, { callId?: string }>)?.before?.callId;
-          const match = trace.snapshots.find(
-            (s) => s.callId === callId && s.snapshotName.startsWith("after@")
-          );
+          const match =
+            trace.snapshots.find(
+              (s) =>
+                s.callId === callId && (s.phase === "after" || s.snapshotName.startsWith("after@"))
+            ) ??
+            trace.snapshots.find(
+              (s) =>
+                s.callId === callId &&
+                (s.phase === "before" || s.snapshotName.startsWith("before@"))
+            );
           if (match) snapshot = match;
         }
       } else {
         const failed = trace.actions.find((a) => a.error);
         if (failed) {
           const callId = (failed.metadata as Record<string, { callId?: string }>)?.before?.callId;
-          const match = trace.snapshots.find(
-            (s) => s.callId === callId && s.snapshotName.startsWith("before@")
-          );
+          const match =
+            trace.snapshots.find(
+              (s) =>
+                s.callId === callId && (s.phase === "after" || s.snapshotName.startsWith("after@"))
+            ) ??
+            trace.snapshots.find(
+              (s) =>
+                s.callId === callId &&
+                (s.phase === "before" || s.snapshotName.startsWith("before@"))
+            );
           if (match) snapshot = match;
         }
       }
 
-      const yaml = snapshotToAriaYaml(snapshot.html);
+      const resolvedHtml = getResolvedSnapshotHtml(trace, snapshot);
+      const yaml = snapshotToAriaYaml(resolvedHtml);
       return {
         content: [
           {
             type: "text",
             text: JSON.stringify(
               {
-                snapshot_name: snapshot.snapshotName,
+                snapshot_name: snapshot.snapshotName || snapshot.phase || "",
                 frame_url: snapshot.frameUrl,
                 timestamp: snapshot.timestamp,
                 aria_tree: yaml,
@@ -478,7 +494,8 @@ server.registerTool(
   async ({ trace_path, screenshot_index }) => {
     try {
       const resolved = await resolveTracePath(trace_path);
-      const screenshots = extractScreenshots(resolved);
+      const trace = await parseTraceZip(resolved);
+      const screenshots = extractScreenshots(resolved, trace.events);
 
       if (screenshots.length === 0) {
         return {
@@ -486,7 +503,6 @@ server.registerTool(
         };
       }
 
-      const trace = await parseTraceZip(resolved);
       const failed = trace.actions.find((a) => a.error);
 
       let target = screenshots[screenshots.length - 1];

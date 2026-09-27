@@ -40,6 +40,7 @@ export interface TraceEvent {
 export interface FrameSnapshot {
   callId: string;
   snapshotName: string;
+  phase?: string;
   frameUrl: string;
   html: unknown;
   timestamp: number;
@@ -69,6 +70,13 @@ export interface StrictTraceMetadata {
   test_sessions_array: TraceSession[];
 }
 
+export interface StackFrame {
+  file: string;
+  line: number;
+  column: number;
+  function?: string;
+}
+
 export interface ParsedTrace {
   metadata: TraceMetadata;
   events: TraceEvent[];
@@ -76,6 +84,7 @@ export interface ParsedTrace {
   network: NetworkEntry[];
   console: ConsoleMessage[];
   snapshots: FrameSnapshot[];
+  stacks?: Map<number, StackFrame[]>;
 }
 
 export interface CriticalFrameResult {

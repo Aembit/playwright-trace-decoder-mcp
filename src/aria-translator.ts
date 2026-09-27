@@ -20,7 +20,9 @@ export function snapshotToAriaYaml(html: unknown): string {
 }
 
 function walkNode(node: SnapNode, lines: string[], depth: number): void {
+  if (!Array.isArray(node) || node.length === 0) return;
   const tag = node[0];
+  if (typeof tag !== "string") return;
   const attrs: Record<string, string> =
     node[1] !== null && typeof node[1] === "object" && !Array.isArray(node[1])
       ? (node[1] as Record<string, string>)
@@ -29,7 +31,7 @@ function walkNode(node: SnapNode, lines: string[], depth: number): void {
     node[1] !== null && typeof node[1] === "object" && !Array.isArray(node[1]) ? 2 : 1;
   const children = node.slice(childStart) as (SnapNode | string)[];
 
-  if (SKIP_TAGS.has(tag)) return;
+  if (SKIP_TAGS.has(tag.toUpperCase())) return;
   if (attrs["aria-hidden"] === "true") return;
 
   const role = resolveRole(tag, attrs);
@@ -57,7 +59,8 @@ function walkNode(node: SnapNode, lines: string[], depth: number): void {
 function resolveRole(tag: string, attrs: Record<string, string>): string | null {
   if (attrs["role"]) return attrs["role"];
 
-  switch (tag) {
+  const upper = tag.toUpperCase();
+  switch (upper) {
     case "HTML":
       return "document";
     case "BODY":
@@ -83,6 +86,7 @@ function resolveRole(tag: string, attrs: Record<string, string>): string | null 
       return "textbox";
     }
     case "SELECT":
+    case "MAT-SELECT":
       return "combobox";
     case "TEXTAREA":
       return "textbox";
@@ -120,9 +124,19 @@ function resolveRole(tag: string, attrs: Record<string, string>): string | null 
     case "DIALOG":
       return "dialog";
     case "PROGRESS":
+    case "MAT-SPINNER":
+    case "MAT-PROGRESS-BAR":
       return "progressbar";
     case "SECTION":
       return attrs["aria-label"] ? "region" : null;
+    case "MAT-CHECKBOX":
+      return "checkbox";
+    case "MAT-RADIO-BUTTON":
+      return "radio";
+    case "MAT-OPTION":
+      return "option";
+    case "MAT-TAB":
+      return "tab";
     // transparent layout tags
     case "DIV":
     case "SPAN":
@@ -131,6 +145,13 @@ function resolveRole(tag: string, attrs: Record<string, string>): string | null 
     case "FIGURE":
     case "DETAILS":
     case "SUMMARY":
+    case "APP-ROOT":
+    case "APP-MAIN-NAVIGATION":
+    case "APP-NAVIGATION":
+    case "MAT-SIDENAV-CONTAINER":
+    case "MAT-SIDENAV-CONTENT":
+    case "NG-COMPONENT":
+    case "AEMBIT-ID-HOVER":
       return null;
     default:
       return null;

@@ -1,5 +1,6 @@
 import { ParsedTrace, TraceAction, LocatorSourceResult } from "./types.js";
 import { snapshotToAriaYaml } from "./aria-translator.js";
+import { getResolvedSnapshotHtml } from "./trace-parser.js";
 
 // ---------------------------------------------------------------------------
 // analyze_race_conditions
@@ -111,19 +112,22 @@ export function getDomMutationDelta(trace: ParsedTrace, actionIndex: number): Do
   if (!callId) return base;
 
   const beforeSnap = trace.snapshots.find(
-    (s) => s.callId === callId && s.snapshotName.startsWith("before@")
+    (s) => s.callId === callId && (s.phase === "before" || s.snapshotName.startsWith("before@"))
   );
   const afterSnap = trace.snapshots.find(
-    (s) => s.callId === callId && s.snapshotName.startsWith("after@")
+    (s) => s.callId === callId && (s.phase === "after" || s.snapshotName.startsWith("after@"))
   );
 
   if (!beforeSnap && !afterSnap) return base;
 
+  const beforeHtml = beforeSnap ? getResolvedSnapshotHtml(trace, beforeSnap) : null;
+  const afterHtml = afterSnap ? getResolvedSnapshotHtml(trace, afterSnap) : null;
+
   const beforeLines = new Set(
-    beforeSnap ? snapshotToAriaYaml(beforeSnap.html).split("\n").filter(Boolean) : []
+    beforeHtml ? snapshotToAriaYaml(beforeHtml).split("\n").filter(Boolean) : []
   );
   const afterLines = new Set(
-    afterSnap ? snapshotToAriaYaml(afterSnap.html).split("\n").filter(Boolean) : []
+    afterHtml ? snapshotToAriaYaml(afterHtml).split("\n").filter(Boolean) : []
   );
 
   const added = [...afterLines].filter((l) => !beforeLines.has(l));
@@ -132,8 +136,8 @@ export function getDomMutationDelta(trace: ParsedTrace, actionIndex: number): Do
 
   return {
     ...base,
-    before_snapshot: beforeSnap?.snapshotName ?? null,
-    after_snapshot: afterSnap?.snapshotName ?? null,
+    before_snapshot: beforeSnap?.snapshotName || beforeSnap?.phase || null,
+    after_snapshot: afterSnap?.snapshotName || afterSnap?.phase || null,
     added,
     removed,
     unchanged_count: unchanged,
@@ -246,7 +250,15 @@ export function getCausalChain(trace: ParsedTrace, lookbackMs = 5000): CausalCha
   // Preceding user-facing actions in the window
   trace.actions
     .filter((a) => a !== failed && a.startTime >= windowStart && a.startTime < failureTime)
-    .filter((a) => INTERACTION_ACTIONS.has(a.type) || a.type.startsWith("expect"))
+    .filter((a) => {
+      const type = a.type.toLowerCase();
+      return (
+        INTERACTION_ACTIONS.has(a.type) ||
+        [...INTERACTION_ACTIONS].some((t) => type.includes(t.split(".")[1])) ||
+        type.startsWith("expect") ||
+        type.startsWith("locator.expect")
+      );
+    })
     .forEach((a) => {
       chain.push({
         time: a.startTime,
@@ -513,11 +525,19 @@ export function mapLocatorToSource(trace: ParsedTrace, actionIndex?: number): Lo
 
   const beforeEvent = action.metadata?.before as Record<string, unknown> | undefined;
   const stepId = beforeEvent?.stepId;
+  const callId = String(beforeEvent?.callId ?? "");
+  const callNum = Number(callId.replace(/^call@/, ""));
 
   let stepTitle: string | undefined;
   let stack: LocatorSourceResult["stack"] = [];
 
-  if (stepId) {
+  // 1. Check trace.stacks (standard in modern Playwright traces and Python / non-JS runners)
+  if (trace.stacks && !isNaN(callNum) && trace.stacks.has(callNum)) {
+    stack = trace.stacks.get(callNum) ?? [];
+  }
+
+  // 2. Fall back to runnerEvent in trace.events if stack is empty
+  if (stack.length === 0 && stepId) {
     const runnerEvent = trace.events.find(
       (e) =>
         (e.class === "Test" || e.origin === "testRunner") &&
@@ -541,12 +561,25 @@ export function mapLocatorToSource(trace: ParsedTrace, actionIndex?: number): Lo
     }
   }
 
+  // Pick source location: prefer the first test file (e.g. test_*.py, *.spec.ts, *.test.ts)
+  // that is not inside framework internals (site-packages, node_modules)
+  let sourceLocation = stack.length > 0 ? stack[0] : null;
+  const testFrame = stack.find(
+    (f) =>
+      !f.file.includes("site-packages") &&
+      !f.file.includes("node_modules") &&
+      (f.file.includes("test_") || f.file.includes(".spec.") || f.file.includes(".test."))
+  );
+  if (testFrame) {
+    sourceLocation = testFrame;
+  }
+
   return {
     action_type: action.type,
     locator: action.locator,
     error: action.error,
     step_title: stepTitle,
     stack,
-    source_location: stack.length > 0 ? stack[0] : null,
+    source_location: sourceLocation,
   };
 }

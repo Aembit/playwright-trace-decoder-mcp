@@ -18,6 +18,7 @@ import {
   TraceScreenshot,
   CriticalFrameResult,
   TrimTraceResult,
+  StackFrame,
 } from "./types.js";
 
 // If trace_path is a URL, download it to a stable temp path keyed by URL hash.
@@ -65,6 +66,29 @@ function cacheSet(key: string, value: { mtime: number; parsed: ParsedTrace }) {
   }
 }
 
+function parseTraceStacks(buffer: Buffer): Map<number, StackFrame[]> {
+  const result = new Map<number, StackFrame[]>();
+  try {
+    const data = JSON.parse(buffer.toString("utf8")) as {
+      files?: string[];
+      stacks?: Array<[number, Array<[number, number, number, string]>]>;
+    };
+    const files = data.files ?? [];
+    for (const [callIdNum, frames] of data.stacks ?? []) {
+      const callFrames: StackFrame[] = frames.map(([fileIdx, line, column, funcName]) => ({
+        file: files[fileIdx] ?? `file#${fileIdx}`,
+        line: Number(line ?? 0),
+        column: Number(column ?? 0),
+        function: funcName ? String(funcName) : undefined,
+      }));
+      result.set(Number(callIdNum), callFrames);
+    }
+  } catch {
+    // skip malformed stacks
+  }
+  return result;
+}
+
 export async function parseTraceZip(zipPath: string): Promise<ParsedTrace> {
   const mtime = statSync(zipPath).mtimeMs;
   const cached = cacheGet(zipPath);
@@ -73,12 +97,15 @@ export async function parseTraceZip(zipPath: string): Promise<ParsedTrace> {
   const zip = new AdmZip(zipPath);
   const traceEvents: TraceEvent[] = [];
   const networkEvents: TraceEvent[] = [];
+  let stacks: Map<number, StackFrame[]> | undefined;
 
   for (const entry of zip.getEntries()) {
     if (entry.entryName.endsWith(".trace")) {
       await parseJsonlBuffer(entry.getData(), traceEvents);
     } else if (entry.entryName.endsWith(".network")) {
       await parseJsonlBuffer(entry.getData(), networkEvents);
+    } else if (entry.entryName.endsWith(".stacks") || entry.entryName === "trace.stacks") {
+      stacks = parseTraceStacks(entry.getData());
     }
   }
 
@@ -89,6 +116,7 @@ export async function parseTraceZip(zipPath: string): Promise<ParsedTrace> {
     network: extractNetwork(networkEvents),
     console: extractConsole(traceEvents),
     snapshots: extractSnapshots(traceEvents),
+    stacks,
   };
 
   cacheSet(zipPath, { mtime, parsed });
@@ -316,6 +344,7 @@ function extractSnapshots(events: TraceEvent[]): FrameSnapshot[] {
       return {
         callId: String(snap.callId ?? ""),
         snapshotName: String(snap.snapshotName ?? ""),
+        phase: snap.phase ? String(snap.phase) : undefined,
         frameUrl: String(snap.frameUrl ?? ""),
         html: snap.html,
         timestamp: Number(snap.timestamp ?? 0),
@@ -323,18 +352,126 @@ function extractSnapshots(events: TraceEvent[]): FrameSnapshot[] {
     });
 }
 
-// Filename pattern: resources/page@<id>-<timestamp>.jpeg
-const SCREENSHOT_RE = /^resources\/page@[^-]+-(\d+)\.jpeg$/;
+function isNodeNameAttrs(n: unknown): n is [string, Record<string, unknown>, ...unknown[]] {
+  return Array.isArray(n) && n.length > 0 && typeof n[0] === "string";
+}
 
-export function extractScreenshots(zipPath: string): TraceScreenshot[] {
+function isSubtreeRef(n: unknown): n is [[number, number]] {
+  return Array.isArray(n) && n.length > 0 && Array.isArray(n[0]) && typeof n[0][0] === "number";
+}
+
+const snapshotNodesCache = new WeakMap<FrameSnapshot, unknown[]>();
+
+function getSnapshotNodes(snapshot: FrameSnapshot): unknown[] {
+  const cached = snapshotNodesCache.get(snapshot);
+  if (cached) return cached;
+  const nodes: unknown[] = [];
+  const visit = (n: unknown) => {
+    if (typeof n === "string") {
+      nodes.push(n);
+    } else if (isNodeNameAttrs(n)) {
+      const hasAttrs = n[1] !== null && typeof n[1] === "object" && !Array.isArray(n[1]);
+      const children = n.slice(hasAttrs ? 2 : 1);
+      for (const c of children) visit(c);
+      nodes.push(n);
+    }
+  };
+  visit(snapshot.html);
+  snapshotNodesCache.set(snapshot, nodes);
+  return nodes;
+}
+
+export function dereferenceSnapshot(snapshots: FrameSnapshot[], index: number): unknown {
+  const target = snapshots[index];
+  if (!target) return undefined;
+
+  function resolve(n: unknown, snapIdx: number, depth = 0): unknown {
+    if (depth > 100) return null;
+    if (typeof n === "string") return n;
+    if (isSubtreeRef(n)) {
+      const delta = n[0][0];
+      const refIdx = snapIdx - delta;
+      if (refIdx >= 0 && refIdx <= snapIdx) {
+        const refSnapshot = snapshots[refIdx];
+        if (refSnapshot) {
+          const nodes = getSnapshotNodes(refSnapshot);
+          const nodeIdx = n[0][1];
+          if (nodeIdx >= 0 && nodeIdx < nodes.length) {
+            return resolve(nodes[nodeIdx], refIdx, depth + 1);
+          }
+        }
+      }
+      return null;
+    }
+    if (isNodeNameAttrs(n)) {
+      const tag = n[0];
+      const hasAttrs = n[1] !== null && typeof n[1] === "object" && !Array.isArray(n[1]);
+      const attrs = hasAttrs ? (n[1] as Record<string, unknown>) : {};
+      const childStart = hasAttrs ? 2 : 1;
+      const children = n.slice(childStart);
+      const resolvedChildren: unknown[] = [];
+      for (const c of children) {
+        const r = resolve(c, snapIdx, depth + 1);
+        if (r !== null && r !== undefined) {
+          resolvedChildren.push(r);
+        }
+      }
+      return [tag, attrs, ...resolvedChildren];
+    }
+    return null;
+  }
+
+  return resolve(target.html, index);
+}
+
+export function getResolvedSnapshotHtml(trace: ParsedTrace, snapshot: FrameSnapshot): unknown {
+  const index = trace.snapshots.indexOf(snapshot);
+  if (index >= 0) {
+    return dereferenceSnapshot(trace.snapshots, index) ?? snapshot.html;
+  }
+  return snapshot.html;
+}
+
+// Filename pattern: resources/page@<id>-<timestamp>.jpeg or screencast/page@<id>-<timestamp>.jpeg
+const SCREENSHOT_RE = /^(?:resources|screencast)\/page@[^-]+-(\d+)\.(?:jpeg|jpg|png)$/;
+
+export function extractScreenshots(zipPath: string, traceEvents?: TraceEvent[]): TraceScreenshot[] {
   const zip = new AdmZip(zipPath);
   const results: TraceScreenshot[] = [];
 
-  for (const entry of zip.getEntries()) {
-    const match = SCREENSHOT_RE.exec(entry.entryName);
-    if (!match) continue;
-    const timestamp = Number(match[1]);
-    results.push({ entryName: entry.entryName, timestamp, data: entry.getData() });
+  let events = traceEvents;
+  if (!events) {
+    const traceEntries = zip.getEntries().filter((e) => e.entryName.endsWith(".trace"));
+    if (traceEntries.length > 0) {
+      events = [];
+      for (const entry of traceEntries) {
+        events.push(...parseJsonlSync(entry.getData()));
+      }
+    }
+  }
+
+  const screencastEvents = (events ?? []).filter(
+    (e) => e.type === "screencast-frame" && e.file && typeof e.timestamp === "number"
+  );
+
+  if (screencastEvents.length > 0) {
+    for (const e of screencastEvents) {
+      const filePath = String(e.file).replace(/^\//, "");
+      const entry = zip.getEntry(filePath);
+      if (!entry) continue;
+      results.push({
+        entryName: filePath,
+        timestamp: Number(e.timestamp),
+        data: entry.getData(),
+      });
+    }
+  } else {
+    for (const entry of zip.getEntries()) {
+      const match = SCREENSHOT_RE.exec(entry.entryName);
+      if (!match) continue;
+      const timestamp = Number(match[1]);
+      results.push({ entryName: entry.entryName, timestamp, data: entry.getData() });
+    }
   }
 
   results.sort((a, b) => a.timestamp - b.timestamp);
@@ -371,7 +508,7 @@ export async function extractCriticalFrames(
   limit = 10
 ): Promise<CriticalFrameResult[]> {
   const trace = await parseTraceZip(zipPath);
-  const screenshots = extractScreenshots(zipPath);
+  const screenshots = extractScreenshots(zipPath, trace.events);
 
   if (screenshots.length === 0) {
     return [];
@@ -436,6 +573,7 @@ export async function extractCriticalFrames(
 
       selected = Array.from(indices)
         .sort((a, b) => a - b)
+        .slice(0, limit)
         .map((idx) => candidates[idx]);
     }
   }
@@ -491,23 +629,22 @@ export async function trimTraceArchive(
   const failedAction = trace.actions.find((a) => a.error);
   let t_fail = 0;
 
+  const screenshots = extractScreenshots(zipPath, trace.events);
+
   if (failedAction) {
     t_fail = failedAction.startTime;
+  } else if (screenshots.length > 0) {
+    t_fail = screenshots[screenshots.length - 1].timestamp;
   } else {
-    const screenshots = extractScreenshots(zipPath);
-    if (screenshots.length > 0) {
-      t_fail = screenshots[screenshots.length - 1].timestamp;
-    } else {
-      const dest = zipPath.replace(/\.zip$/, ".trimmed.zip");
-      zip.writeZip(dest);
-      const newStats = statSync(dest);
-      return {
-        original_size_bytes: originalSize,
-        trimmed_size_bytes: newStats.size,
-        compression_ratio_percent: 0,
-        trimmed_trace_path: dest,
-      };
-    }
+    const dest = zipPath.replace(/\.zip$/, ".trimmed.zip");
+    zip.writeZip(dest);
+    const newStats = statSync(dest);
+    return {
+      original_size_bytes: originalSize,
+      trimmed_size_bytes: newStats.size,
+      compression_ratio_percent: 0,
+      trimmed_trace_path: dest,
+    };
   }
 
   // Window: t_fail - 5000ms to t_fail + 1000ms
@@ -515,14 +652,9 @@ export async function trimTraceArchive(
   const windowEnd = t_fail + 1000;
 
   if (divergenceOnly) {
-    const entries = zip.getEntries();
-    for (const entry of entries) {
-      const match = SCREENSHOT_RE.exec(entry.entryName);
-      if (!match) continue;
-      const timestamp = Number(match[1]);
-
-      if (timestamp < windowStart || timestamp > windowEnd) {
-        zip.deleteFile(entry.entryName);
+    for (const s of screenshots) {
+      if (s.timestamp < windowStart || s.timestamp > windowEnd) {
+        zip.deleteFile(s.entryName);
       }
     }
   }
