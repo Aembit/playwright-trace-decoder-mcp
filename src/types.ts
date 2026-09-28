@@ -1,8 +1,9 @@
 export interface TraceMetadata {
+  title?: string;
+  testTitle?: string;
   browser?: string;
   platform?: string;
   viewport?: { width: number; height: number };
-  testTitle?: string;
   wallTime?: number;
 }
 
@@ -23,6 +24,7 @@ export interface NetworkEntry {
   duration: number;
   mimeType: string;
   body_snippet?: string;
+  resource_ref?: string;
 }
 
 export interface ConsoleMessage {
@@ -85,6 +87,7 @@ export interface ParsedTrace {
   console: ConsoleMessage[];
   snapshots: FrameSnapshot[];
   stacks?: Map<number, StackFrame[]>;
+  resolveResource?: (shaOrFile: string) => string | undefined;
 }
 
 export interface CriticalFrameResult {

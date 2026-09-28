@@ -19,6 +19,10 @@ import {
   getCausalChain,
   detectPerformanceAnomalies,
   mapLocatorToSource,
+  getElementStateAtFailure,
+  queryNetworkRequests,
+  searchDomSnapshots,
+  triageFailureBundle,
 } from "./diagnostics.js";
 import { generateErrorSignature, compareTraces } from "./cross-trace.js";
 
@@ -306,29 +310,12 @@ server.registerTool(
   async ({ trace_path }) => {
     try {
       const trace = await parseTraceZip(await resolveTracePath(trace_path));
-      const failedAction = trace.actions.find((a) => a.error);
-      if (!failedAction) {
-        return {
-          content: [
-            { type: "text", text: JSON.stringify({ message: "No failure found in trace" }) },
-          ],
-        };
-      }
+      const result = getElementStateAtFailure(trace);
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                failed_action: failedAction.type,
-                locator: failedAction.locator,
-                error: failedAction.error,
-                time: failedAction.startTime,
-                raw: failedAction.metadata,
-              },
-              null,
-              2
-            ),
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };
@@ -754,6 +741,181 @@ server.registerTool(
     try {
       const resolved = await resolveTracePath(trace_path);
       const result = await trimTraceArchive(resolved, divergence_only ?? true);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "query_network_requests",
+  {
+    description:
+      "Queries and filters HTTP network requests in a Playwright trace. Supports filtering by " +
+      "URL pattern, HTTP method, status code, and temporal time window (monotonic ms). Resolves " +
+      "attached HAR response bodies from trace resources.",
+    inputSchema: traceInputSchema.extend({
+      url_pattern: z
+        .string()
+        .optional()
+        .describe(
+          "Substring or regex to filter request URLs (e.g. '/api/', 'credential-providers')"
+        ),
+      method: z
+        .string()
+        .optional()
+        .describe("HTTP method filter (e.g. 'GET', 'POST', 'PUT', 'DELETE')"),
+      status: z.number().int().optional().describe("HTTP status code filter (e.g. 200, 404, 500)"),
+      status_range: z.string().optional().describe("HTTP status range (e.g. '2xx', '4xx', '5xx')"),
+      start_time: z.number().optional().describe("Monotonic start time in ms to filter requests"),
+      end_time: z.number().optional().describe("Monotonic end time in ms to filter requests"),
+      include_body: z
+        .boolean()
+        .default(false)
+        .optional()
+        .describe("If true, resolves and includes response body from attached trace resources"),
+      max_body_chars: z
+        .number()
+        .int()
+        .default(500)
+        .optional()
+        .describe(
+          "Max characters of response body to return (default 500, set to 0 for unlimited)"
+        ),
+      limit: z
+        .number()
+        .int()
+        .default(50)
+        .optional()
+        .describe("Maximum number of requests to return (default 50)"),
+    }),
+  },
+  async ({
+    trace_path,
+    url_pattern,
+    method,
+    status,
+    status_range,
+    start_time,
+    end_time,
+    include_body,
+    max_body_chars,
+    limit,
+  }) => {
+    try {
+      const trace = await parseTraceZip(await resolveTracePath(trace_path));
+      const result = queryNetworkRequests(trace, {
+        url_pattern,
+        method,
+        status,
+        status_range,
+        start_time,
+        end_time,
+        include_body,
+        max_body_chars,
+        limit,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "search_dom_snapshots",
+  {
+    description:
+      "Searches reconstructed DOM snapshots for specific text content, regular expressions, or CSS selectors " +
+      "at a specific action index, Playwright callId, or the failure snapshot. Returns matching tags, attributes, " +
+      "text content, and parent container context without requiring a full accessibility tree dump.",
+    inputSchema: traceInputSchema.extend({
+      text: z
+        .string()
+        .optional()
+        .describe("Text substring to search for in DOM elements or attributes"),
+      pattern: z
+        .string()
+        .optional()
+        .describe("Regular expression pattern to match in DOM elements"),
+      selector: z
+        .string()
+        .optional()
+        .describe(
+          "CSS selector (e.g. 'button.save', '[data-testid=\"submit\"]', '#id') or Playwright locator"
+        ),
+      action_index: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("Action index to inspect (0-based, from get_action_timeline)"),
+      call_id: z
+        .string()
+        .optional()
+        .describe("Playwright callId (e.g. 'call@2685') to resolve snapshot"),
+      phase: z
+        .enum(["before", "after", "action"])
+        .optional()
+        .describe("Snapshot phase ('before', 'after', or 'action')"),
+      limit: z
+        .number()
+        .int()
+        .default(20)
+        .optional()
+        .describe("Maximum matching elements to return (default 20)"),
+    }),
+  },
+  async ({ trace_path, text, pattern, selector, action_index, call_id, phase, limit }) => {
+    try {
+      const trace = await parseTraceZip(await resolveTracePath(trace_path));
+      const result = searchDomSnapshots(trace, {
+        text,
+        pattern,
+        selector,
+        action_index,
+        call_id,
+        phase,
+        limit,
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (err) {
+      return errorResponse(err);
+    }
+  }
+);
+
+server.registerTool(
+  "triage_failure_bundle",
+  {
+    description:
+      "One-turn composite diagnostic bundle for failed tests. Returns the failed action, " +
+      "test runner source code location (file and line), failure screenshot (base64 JPEG), " +
+      "API network requests completed within 5 seconds of failure (with response bodies), and " +
+      "the DOM element state at failure.",
+    inputSchema: traceInputSchema.extend({
+      lookback_ms: z
+        .number()
+        .int()
+        .min(1000)
+        .max(30000)
+        .default(5000)
+        .optional()
+        .describe("Time window in ms before failure to capture network requests (default 5000)"),
+    }),
+  },
+  async ({ trace_path, lookback_ms }) => {
+    try {
+      const resolved = await resolveTracePath(trace_path);
+      const trace = await parseTraceZip(resolved);
+      const result = triageFailureBundle(trace, resolved, lookback_ms ?? 5000);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
       };

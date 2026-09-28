@@ -1,4 +1,4 @@
-type SnapNode = [string, Record<string, string>, ...(SnapNode | string)[]];
+export type SnapNode = [string, Record<string, string>, ...(SnapNode | string)[]];
 
 const SKIP_TAGS = new Set([
   "SCRIPT",
@@ -56,7 +56,7 @@ function walkNode(node: SnapNode, lines: string[], depth: number): void {
   }
 }
 
-function resolveRole(tag: string, attrs: Record<string, string>): string | null {
+export function resolveRole(tag: string, attrs: Record<string, string>): string | null {
   if (attrs["role"]) return attrs["role"];
 
   const upper = tag.toUpperCase();
@@ -158,7 +158,7 @@ function resolveRole(tag: string, attrs: Record<string, string>): string | null 
   }
 }
 
-function resolveName(
+export function resolveName(
   tag: string,
   attrs: Record<string, string>,
   children: (SnapNode | string)[]
@@ -212,7 +212,7 @@ function resolveExtra(tag: string, attrs: Record<string, string>): string {
   return parts.join(" ");
 }
 
-function extractText(children: (SnapNode | string)[]): string {
+export function extractText(children: (SnapNode | string)[]): string {
   let text = "";
   for (const child of children) {
     if (typeof child === "string") {

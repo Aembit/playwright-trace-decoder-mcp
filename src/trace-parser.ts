@@ -109,14 +109,45 @@ export async function parseTraceZip(zipPath: string): Promise<ParsedTrace> {
     }
   }
 
+  const resolveResource = (shaOrFile: string): string | undefined => {
+    if (!shaOrFile) return undefined;
+    let entry: AdmZip.IZipEntry | null | undefined = zip.getEntry(shaOrFile);
+    if (!entry) {
+      const stripped = shaOrFile.replace(/^resources\//, "");
+      entry = zip.getEntry(`resources/${stripped}`);
+      if (!entry) {
+        const allEntries = zip.getEntries();
+        entry = allEntries.find((e) => {
+          const name = e.entryName;
+          return (
+            name === shaOrFile ||
+            name === `resources/${shaOrFile}` ||
+            name === `resources/${stripped}` ||
+            name.startsWith(`resources/${stripped}.`) ||
+            name.includes(stripped)
+          );
+        });
+      }
+    }
+    if (entry) {
+      try {
+        return entry.getData().toString("utf8");
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  };
+
   const parsed: ParsedTrace = {
-    metadata: extractMetadata(traceEvents),
+    metadata: extractMetadata(traceEvents, stacks, zipPath),
     events: traceEvents,
     actions: extractActions(traceEvents),
-    network: extractNetwork(networkEvents),
+    network: extractNetwork(networkEvents, traceEvents, resolveResource),
     console: extractConsole(traceEvents),
     snapshots: extractSnapshots(traceEvents),
     stacks,
+    resolveResource,
   };
 
   cacheSet(zipPath, { mtime, parsed });
@@ -242,16 +273,71 @@ async function parseJsonlBuffer(buffer: Buffer, target: TraceEvent[]): Promise<v
   }
 }
 
-function extractMetadata(events: TraceEvent[]): TraceMetadata {
+export function extractMetadata(
+  events: TraceEvent[],
+  stacks?: Map<number, StackFrame[]>,
+  zipPath?: string
+): TraceMetadata {
   const ctx = events.find((e) => e.type === "context-options");
-  if (!ctx) return {};
-  const options = ctx.options as Record<string, unknown> | undefined;
+  const options = ctx?.options as Record<string, unknown> | undefined;
+
+  let testTitle: string | undefined = ctx?.title ? String(ctx.title) : undefined;
+
+  // Fallback 1: Resolve from trace.stacks (e.g. pytest-playwright)
+  if (!testTitle && stacks) {
+    // Pass 1: Look across all calls for a function explicitly starting with test_
+    for (const frames of stacks.values()) {
+      const testFrame = frames.find(
+        (f) => f.function && /^test_/i.test(f.function) && !f.file?.includes("site-packages")
+      );
+      if (testFrame?.function) {
+        testTitle = testFrame.function;
+        break;
+      }
+    }
+
+    // Pass 2: If no function starts with test_, check for non-fixture functions in test files
+    if (!testTitle) {
+      for (const frames of stacks.values()) {
+        const testFrame = frames.find(
+          (f) =>
+            f.file &&
+            /(?:test_[^/]+|[^/]+_test|\.test|\.spec)\.[a-zA-Z0-9]+$/i.test(f.file) &&
+            !f.file?.includes("site-packages") &&
+            f.function &&
+            !f.function.startsWith("<") &&
+            !f.function.endsWith("Page") &&
+            !f.function.endsWith("Fixture")
+        );
+        if (testFrame?.function) {
+          testTitle = testFrame.function;
+          break;
+        }
+      }
+    }
+  }
+
+  // Fallback 2: Resolve from zip base filename
+  if (!testTitle && zipPath) {
+    const base = zipPath.split("/").pop() ?? zipPath;
+    const cleaned = base
+      .replace(/\.pwtrace\.zip$/i, "")
+      .replace(/\.trimmed\.zip$/i, "")
+      .replace(/\.zip$/i, "")
+      .replace(/-retry\d+$/i, "")
+      .replace(/\.trace$/i, "");
+    if (cleaned && cleaned !== "trace") {
+      testTitle = cleaned;
+    }
+  }
+
   return {
-    browser: ctx.browserName ? String(ctx.browserName) : undefined,
-    platform: ctx.platform ? String(ctx.platform) : undefined,
+    title: testTitle,
+    testTitle,
+    browser: ctx?.browserName ? String(ctx.browserName) : undefined,
+    platform: ctx?.platform ? String(ctx.platform) : undefined,
     viewport: options?.viewport as { width: number; height: number } | undefined,
-    testTitle: ctx.title ? String(ctx.title) : undefined,
-    wallTime: ctx.wallTime ? Number(ctx.wallTime) : undefined,
+    wallTime: ctx?.wallTime ? Number(ctx.wallTime) : undefined,
   };
 }
 
@@ -308,7 +394,24 @@ function extractActions(events: TraceEvent[]): TraceAction[] {
     });
 }
 
-function extractNetwork(networkEvents: TraceEvent[]): NetworkEntry[] {
+export function extractNetwork(
+  networkEvents: TraceEvent[],
+  traceEvents?: TraceEvent[],
+  resolveResource?: (shaOrFile: string) => string | undefined
+): NetworkEntry[] {
+  let monotonicBase: number | undefined;
+  let wallBase: number | undefined;
+
+  if (traceEvents) {
+    const ctx = traceEvents.find((e) => e.type === "context-options");
+    if (typeof ctx?.monotonicTime === "number") {
+      monotonicBase = Number(ctx.monotonicTime);
+    }
+    if (typeof ctx?.wallTime === "number") {
+      wallBase = Number(ctx.wallTime);
+    }
+  }
+
   return networkEvents
     .filter((e) => e.type === "resource-snapshot")
     .map((e) => {
@@ -316,21 +419,52 @@ function extractNetwork(networkEvents: TraceEvent[]): NetworkEntry[] {
       const req = snap.request as Record<string, unknown>;
       const resp = snap.response as Record<string, unknown>;
       const content = resp?.content as Record<string, unknown> | undefined;
+
+      let resource_ref: string | undefined;
+      if (content?._file) {
+        resource_ref = String(content._file);
+      } else if (content?._sha1) {
+        resource_ref = String(content._sha1);
+      }
+
       let body_snippet: string | undefined;
       if (content?._base64) {
         body_snippet = Buffer.from(String(content._base64), "base64")
           .toString("utf8")
-          .slice(0, 200);
+          .slice(0, 500);
       } else if (content?.text) {
-        body_snippet = String(content.text).slice(0, 200);
+        body_snippet = String(content.text).slice(0, 500);
+      } else if (resource_ref && resolveResource) {
+        const resolved = resolveResource(resource_ref);
+        if (resolved) {
+          body_snippet = resolved.slice(0, 500);
+        }
       }
+
+      let startTime = 0;
+      if (typeof snap._monotonicTime === "number" && snap._monotonicTime > 0) {
+        startTime = Number(snap._monotonicTime);
+      } else if (snap.startedDateTime) {
+        const startedDateTimeMs = new Date(String(snap.startedDateTime)).getTime();
+        if (!isNaN(startedDateTimeMs)) {
+          if (monotonicBase !== undefined && wallBase !== undefined) {
+            startTime = monotonicBase + (startedDateTimeMs - wallBase);
+          } else {
+            startTime = startedDateTimeMs;
+          }
+        }
+      } else {
+        startTime = Number(snap.time ?? 0);
+      }
+
       return {
         url: String(req?.url ?? ""),
         method: String(req?.method ?? "GET"),
         status: Number(resp?.status ?? 0),
-        startTime: Number(snap._monotonicTime ?? 0),
+        startTime,
         duration: Number(snap.time ?? 0),
         mimeType: String(content?.mimeType ?? "other"),
+        ...(resource_ref !== undefined ? { resource_ref } : {}),
         ...(body_snippet !== undefined ? { body_snippet } : {}),
       };
     });
